@@ -4,13 +4,17 @@
 #   publish.sh <file-or-folder> [--name "Display name"] [--spa] [--new]
 #
 # Re-publishing the same folder updates the same site (state lives in ~/.bigangels/sites.json).
-# Env: BIGANGELS_API (API origin), BIGANGELS_CLIENT (agent name, e.g. claude-code/publish-sh).
+# Env: BIGANGELS_API (API origin), BIGANGELS_CLIENT (optional override, e.g. cursor/publish-sh).
 
 set -euo pipefail
 
 # Local development: export BIGANGELS_API=http://bigangels.localhost:8787
 API="${BIGANGELS_API:-https://api.bigangels.app}"
-CLIENT="${BIGANGELS_CLIENT:-claude-code/publish-sh}"
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=client.sh
+source "$_SCRIPT_DIR/client.sh"
+_INVOKING="${BASH_SOURCE[0]}"
+CLIENT="$(bigangels_client_id "$_INVOKING" publish-sh)"
 STATE_DIR="${BIGANGELS_HOME:-$HOME/.bigangels}"
 STATE_FILE="$STATE_DIR/sites.json"
 
@@ -52,6 +56,7 @@ content_type() {
   case "$(echo "${1##*.}" | tr '[:upper:]' '[:lower:]')" in
     html|htm) echo "text/html; charset=utf-8" ;;   css) echo "text/css; charset=utf-8" ;;
     js|mjs) echo "text/javascript; charset=utf-8" ;; json) echo "application/json; charset=utf-8" ;;
+    jsonl) echo "application/jsonl; charset=utf-8" ;;
     md) echo "text/markdown; charset=utf-8" ;;       txt) echo "text/plain; charset=utf-8" ;;
     csv) echo "text/csv; charset=utf-8" ;;           xml) echo "application/xml; charset=utf-8" ;;
     svg) echo "image/svg+xml" ;; png) echo "image/png" ;; jpg|jpeg) echo "image/jpeg" ;;
@@ -74,10 +79,63 @@ mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
 [[ -f "$STATE_FILE" ]] || echo '{}' >"$STATE_FILE"
 SAVED="$(jq -c --arg k "$KEY" '.[$k] // empty' "$STATE_FILE")"
 
-# Signed in (via login.sh) means permanent sites; otherwise sites are anonymous and expire in 24h.
+# Publishing requires a signed-in account (login.sh saves the key in credentials).
 API_KEY="${BIGANGELS_API_KEY:-$(cat "$STATE_DIR/credentials" 2>/dev/null || true)}"
 AUTH=()
 [[ -n "$API_KEY" ]] && AUTH=(-H "Authorization: Bearer $API_KEY")
+
+LOGIN_SH="$(cd "$(dirname "$0")" && pwd)/login.sh"
+
+is_ci() { [[ -n "${GITHUB_ACTIONS:-}" || "${CI:-}" == "true" ]]; }
+
+can_auto_browser_sign_in() {
+  [[ -t 1 ]] && command -v python3 >/dev/null && ! is_ci
+}
+
+headless_sign_in_help() {
+  echo "error: sign in required before publishing." >&2
+  echo "  Run: $LOGIN_SH   (opens the browser; one command)" >&2
+  echo "  Headless / SSH: $LOGIN_SH --email you@example.com  then verify with the code" >&2
+  echo "  Or paste a key from Settings → API keys into ~/.bigangels/credentials" >&2
+  echo "  Status: $LOGIN_SH --status" >&2
+}
+
+reload_credentials() {
+  API_KEY="${BIGANGELS_API_KEY:-$(cat "$STATE_DIR/credentials" 2>/dev/null || true)}"
+  if [[ -n "$API_KEY" ]]; then AUTH=(-H "Authorization: Bearer $API_KEY"); else AUTH=(); fi
+}
+
+auto_sign_in_or_die() {
+  local reason="$1"
+  if can_auto_browser_sign_in; then
+    echo "$reason" >&2
+    echo "Starting browser sign-in…" >&2
+    BIGANGELS_CLIENT="$CLIENT" bash "$LOGIN_SH" || die "sign-in failed — run: $LOGIN_SH"
+    reload_credentials
+    [[ -n "$API_KEY" ]] || die "sign-in did not save credentials — run: $LOGIN_SH"
+    return 0
+  fi
+  headless_sign_in_help
+  exit 1
+}
+
+credentials_valid() {
+  [[ -n "$API_KEY" ]] || return 1
+  local out
+  out="$(curl -sS "$API/api/v1/me" -H "Authorization: Bearer $API_KEY" -w $'\n%{http_code}')" || die "could not reach $API"
+  [[ "${out##*$'\n'}" == 200 ]]
+}
+
+require_sign_in() {
+  if credentials_valid; then return 0; fi
+  if [[ -z "$API_KEY" ]]; then
+    auto_sign_in_or_die "Sign in required before publishing."
+  else
+    auto_sign_in_or_die "Your saved sign-in is no longer valid."
+  fi
+  credentials_valid || die "sign-in did not stick — run: $LOGIN_SH"
+}
+require_sign_in
 
 # call METHOD URL BODY -> sets RESPONSE and STATUS
 call() {
@@ -105,7 +163,7 @@ if [[ -z "$STATUS" ]]; then
   CLAIM="$(jq -r '.claimToken // empty' <<<"$RESPONSE" 2>/dev/null || true)"
   CLAIM_URL="$(jq -r '.claimUrl // empty' <<<"$RESPONSE" 2>/dev/null || true)"
 fi
-[[ "$STATUS" == 401 ]] && die "your saved sign-in is no longer valid. Sign in again with login.sh, or delete $STATE_DIR/credentials to publish anonymously."
+[[ "$STATUS" == 401 ]] && die "sign in required or your saved key is invalid. Run login.sh again."
 [[ "$STATUS" =~ ^2 ]] || die "publish failed ($STATUS): $(jq -r '.error // .' <<<"$RESPONSE" 2>/dev/null || echo "$RESPONSE")"
 
 SLUG="$(jq -r .slug <<<"$RESPONSE")"
@@ -125,9 +183,21 @@ done < <(jq -r '.upload.uploads[] | [.path, .url, .headers["Content-Type"]] | @t
 [[ "$TOTAL" -gt 0 ]] && echo >&2
 
 call POST "$FINALIZE" "$(jq -n --arg v "$VERSION" '{versionId: $v}')"
-[[ "$STATUS" =~ ^2 ]] || die "finalize failed ($STATUS): $(jq -r '.error // .' <<<"$RESPONSE")"
+[[ "$STATUS" =~ ^2 ]] || die "finalize failed ($STATUS): $(jq -r '.error // .message // .' <<<"$RESPONSE" 2>/dev/null || echo "$RESPONSE")"
 
+LIVE="$(jq -r '.live // empty' <<<"$RESPONSE")"
+[[ "$LIVE" == "true" ]] || die "finalize did not mark the site live — do not share a URL yet"
+STATE="$(jq -r '.publishStatus.state // empty' <<<"$RESPONSE")"
+[[ "$STATE" == "live" ]] || die "finalize response missing publishStatus.state=live"
 URL="$(jq -r .siteUrl <<<"$RESPONSE")"
+[[ -n "$URL" && "$URL" != "null" ]] || die "finalize succeeded but no siteUrl was returned"
+
+RESP_API="$(jq -r '.apiOrigin // empty' <<<"$RESPONSE")"
+if [[ -n "$RESP_API" && "$RESP_API" != "$API" ]]; then
+  die "API mismatch: you called $API but finalize returned apiOrigin $RESP_API — set BIGANGELS_API to match the environment you want"
+fi
+serve_code="$(curl -sS -o /dev/null -w '%{http_code}' "$URL" || true)"
+[[ "$serve_code" =~ ^2 ]] || die "site is not reachable at $URL ($serve_code). If BIGANGELS_API points at localhost or an old host, production links will not work."
 EXPIRES="$(jq -r '.publishStatus.expiresAt // empty' <<<"$RESPONSE")"
 TMP="$(mktemp)"
 jq --arg k "$KEY" --arg slug "$SLUG" --arg claim "${CLAIM:-}" --arg claimUrl "${CLAIM_URL:-}" --arg url "$URL" --arg exp "$EXPIRES" \
