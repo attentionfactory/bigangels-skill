@@ -20,7 +20,9 @@ Windows (PowerShell):
 irm https://bigangels.app/install.ps1 | iex
 ```
 
-Then tell your agent: **"Publish this to BigAngels"**. Sign in via `login.sh` (browser) when `publish.sh` needs it, or `login.sh --email` on SSH.
+Then tell your agent: **"Publish this to BigAngels"**. Your site is public immediately, without signing in. Anonymous previews expire in six hours; sign in with `login.sh --email` when you want to keep them.
+
+To test anonymous publishing while signed in, run `publish.sh <path> --anonymous`. It ignores saved and environment credentials and remembers anonymous previews separately from account-owned sites. `login.sh --logout` removes the shared local sign-in without uninstalling the skill.
 
 **MCP (OAuth)** is separate: add `https://api.bigangels.app/mcp` in Cursor Settings → MCP or your client's Connectors UI. `install.sh` does not configure MCP.
 
@@ -28,7 +30,7 @@ Then tell your agent: **"Publish this to BigAngels"**. Sign in via `login.sh` (b
 
 - `skills/bigangels/SKILL.md` — what the agent reads: artifact types, publish workflow, sign-in, troubleshooting.
 - `skills/bigangels/scripts/publish.sh` — publishes a file or folder, remembers which folder maps to which site, and only uploads files that changed.
-- `skills/bigangels/scripts/login.sh` — browser sign-in from the terminal (one command); `--email` for headless SSH.
+- `skills/bigangels/scripts/login.sh` — email-code sign-in in chat by default (`--email`); optional `--browser` sign-in.
 
 Docs: https://bigangels.app/docs
 

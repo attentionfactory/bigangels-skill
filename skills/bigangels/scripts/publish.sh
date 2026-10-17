@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Publish a file or folder to BigAngels and print the live URL.
 #
-#   publish.sh <file-or-folder> [--name "Display name"] [--spa] [--new]
+#   publish.sh <file-or-folder> [--name "Display name"] [--spa] [--new] [--anonymous]
 #
 # Re-publishing the same folder updates the same site (state lives in ~/.bigangels/sites.json).
+# --anonymous ignores saved/environment credentials and remembers previews separately.
 # Env: BIGANGELS_API (API origin), BIGANGELS_CLIENT (optional override, e.g. cursor/publish-sh).
 
 set -euo pipefail
@@ -17,26 +18,30 @@ _INVOKING="${BASH_SOURCE[0]}"
 CLIENT="$(bigangels_client_id "$_INVOKING" publish-sh)"
 STATE_DIR="${BIGANGELS_HOME:-$HOME/.bigangels}"
 STATE_FILE="$STATE_DIR/sites.json"
+DEVICE="$(bigangels_publish_device_id "$STATE_DIR")"
+DEVICE_HDR=(-H "X-BigAngels-Publish-Device: $DEVICE")
 
 die() { echo "error: $*" >&2; exit 1; }
 
 command -v curl >/dev/null || die "curl is required"
 command -v jq >/dev/null || die "jq is required (macOS: brew install jq)"
-if command -v shasum >/dev/null; then sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
-elif command -v sha256sum >/dev/null; then sha256() { sha256sum "$1" | cut -d' ' -f1; }
+if command -v shasum >/dev/null; then sha256() { LC_ALL=C shasum -a 256 "$1" | cut -d' ' -f1; }
+elif command -v sha256sum >/dev/null; then sha256() { LC_ALL=C sha256sum "$1" | cut -d' ' -f1; }
 else die "shasum or sha256sum is required"; fi
 
-TARGET="" NAME="" SPA="" FORCE_NEW=""
+TARGET="" NAME="" SPA="" FORCE_NEW="" ANONYMOUS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name) NAME="${2:-}"; shift 2 ;;
     --spa) SPA=1; shift ;;
     --new) FORCE_NEW=1; shift ;;
+    --anonymous) ANONYMOUS=1; shift ;;
     -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
     *) [[ -z "$TARGET" ]] || die "only one file or folder can be published at a time"; TARGET="$1"; shift ;;
   esac
 done
-[[ -n "$TARGET" && -e "$TARGET" ]] || die "usage: publish.sh <file-or-folder> [--name NAME] [--spa] [--new]"
+[[ -n "$TARGET" && -e "$TARGET" ]] || die "usage: publish.sh <file-or-folder> [--name NAME] [--spa] [--new] [--anonymous]"
+[[ -n "$ANONYMOUS" ]] && STATE_FILE="$STATE_DIR/anonymous-sites.json"
 
 if [[ -d "$TARGET" ]]; then
   ROOT="$(cd "$TARGET" && pwd)"
@@ -71,7 +76,9 @@ content_type() {
 
 MANIFEST="$(
   for f in "${FILES[@]}"; do
-    printf '%s\t%s\t%s\t%s\n' "$f" "$(wc -c <"$ROOT/$f" | tr -d ' ')" "$(content_type "$f")" "$(sha256 "$ROOT/$f")"
+    hash="$(sha256 "$ROOT/$f")" || exit 1
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || exit 1
+    printf '%s\t%s\t%s\t%s\n' "$f" "$(wc -c <"$ROOT/$f" | tr -d ' ')" "$(content_type "$f")" "$hash"
   done | jq -Rn '[inputs | split("\t") | {path: .[0], size: (.[1] | tonumber), contentType: .[2], hash: .[3]}]'
 )"
 
@@ -79,69 +86,41 @@ mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
 [[ -f "$STATE_FILE" ]] || echo '{}' >"$STATE_FILE"
 SAVED="$(jq -c --arg k "$KEY" '.[$k] // empty' "$STATE_FILE")"
 
-# Publishing requires a signed-in account (login.sh saves the key in credentials).
-API_KEY="${BIGANGELS_API_KEY:-$(cat "$STATE_DIR/credentials" 2>/dev/null || true)}"
+# With no key, publish a public six-hour preview. Explicit anonymous mode never reads credentials.
+API_KEY=""
+if [[ -z "$ANONYMOUS" ]]; then
+  API_KEY="${BIGANGELS_API_KEY:-$(cat "$STATE_DIR/credentials" 2>/dev/null || true)}"
+fi
 AUTH=()
 [[ -n "$API_KEY" ]] && AUTH=(-H "Authorization: Bearer $API_KEY")
-
-LOGIN_SH="$(cd "$(dirname "$0")" && pwd)/login.sh"
-
-is_ci() { [[ -n "${GITHUB_ACTIONS:-}" || "${CI:-}" == "true" ]]; }
-
-can_auto_browser_sign_in() {
-  [[ -t 1 ]] && command -v python3 >/dev/null && ! is_ci
-}
-
-headless_sign_in_help() {
-  echo "error: sign in required before publishing." >&2
-  echo "  Run: $LOGIN_SH   (opens the browser; one command)" >&2
-  echo "  Headless / SSH: $LOGIN_SH --email you@example.com  then verify with the code" >&2
-  echo "  Or paste a key from Settings → API keys into ~/.bigangels/credentials" >&2
-  echo "  Status: $LOGIN_SH --status" >&2
-}
-
-reload_credentials() {
-  API_KEY="${BIGANGELS_API_KEY:-$(cat "$STATE_DIR/credentials" 2>/dev/null || true)}"
-  if [[ -n "$API_KEY" ]]; then AUTH=(-H "Authorization: Bearer $API_KEY"); else AUTH=(); fi
-}
-
-auto_sign_in_or_die() {
-  local reason="$1"
-  if can_auto_browser_sign_in; then
-    echo "$reason" >&2
-    echo "Starting browser sign-in…" >&2
-    BIGANGELS_CLIENT="$CLIENT" bash "$LOGIN_SH" || die "sign-in failed — run: $LOGIN_SH"
-    reload_credentials
-    [[ -n "$API_KEY" ]] || die "sign-in did not save credentials — run: $LOGIN_SH"
-    return 0
-  fi
-  headless_sign_in_help
-  exit 1
-}
 
 credentials_valid() {
   [[ -n "$API_KEY" ]] || return 1
   local out
   out="$(curl -sS "$API/api/v1/me" -H "Authorization: Bearer $API_KEY" -w $'\n%{http_code}')" || die "could not reach $API"
-  [[ "${out##*$'\n'}" == 200 ]]
+  case "${out##*$'\n'}" in
+    200) return 0 ;;
+    401) return 1 ;;
+    *) die "could not check sign-in; retry without replacing credentials" ;;
+  esac
 }
 
-require_sign_in() {
+maybe_sign_in() {
   if credentials_valid; then return 0; fi
-  if [[ -z "$API_KEY" ]]; then
-    auto_sign_in_or_die "Sign in required before publishing."
-  else
-    auto_sign_in_or_die "Your saved sign-in is no longer valid."
+  if [[ -n "$API_KEY" ]]; then
+    echo "saved sign-in is no longer valid — publishing without an account (deleted in 6 hours)" >&2
+    API_KEY=""
+    AUTH=()
   fi
-  credentials_valid || die "sign-in did not stick — run: $LOGIN_SH"
+  return 0
 }
-require_sign_in
+maybe_sign_in
 
 # call METHOD URL BODY -> sets RESPONSE and STATUS
 call() {
   local out
   out="$(curl -sS -X "$1" "$2" -H "content-type: application/json" -H "X-BigAngels-Client: $CLIENT" \
-    ${AUTH[@]+"${AUTH[@]}"} --data-binary "$3" -w $'\n%{http_code}')" || die "could not reach $API"
+    "${DEVICE_HDR[@]}" ${AUTH[@]+"${AUTH[@]}"} --data-binary "$3" -w $'\n%{http_code}')" || die "could not reach $API"
   STATUS="${out##*$'\n'}"; RESPONSE="${out%$'\n'*}"
 }
 
@@ -156,6 +135,9 @@ if [[ -n "$SAVED" && -z "$FORCE_NEW" ]]; then
   if [[ "$STATUS" == 404 || "$STATUS" == 410 ]]; then
     echo "previous site $SLUG is gone (expired); creating a new one" >&2
     STATUS=""
+  elif [[ "$STATUS" == 401 && -n "$ANONYMOUS" ]]; then
+    echo "previous preview is now account-owned; creating a new anonymous preview" >&2
+    STATUS=""
   fi
 fi
 if [[ -z "$STATUS" ]]; then
@@ -163,7 +145,7 @@ if [[ -z "$STATUS" ]]; then
   CLAIM="$(jq -r '.claimToken // empty' <<<"$RESPONSE" 2>/dev/null || true)"
   CLAIM_URL="$(jq -r '.claimUrl // empty' <<<"$RESPONSE" 2>/dev/null || true)"
 fi
-[[ "$STATUS" == 401 ]] && die "sign in required or your saved key is invalid. Run login.sh again."
+[[ "$STATUS" == 401 ]] && die "authentication failed. Use --anonymous for a new public 6-hour preview, or sign in with login.sh to update an account-owned site."
 [[ "$STATUS" =~ ^2 ]] || die "publish failed ($STATUS): $(jq -r '.error // .' <<<"$RESPONSE" 2>/dev/null || echo "$RESPONSE")"
 
 SLUG="$(jq -r .slug <<<"$RESPONSE")"
@@ -182,7 +164,8 @@ while IFS=$'\t' read -r path url ctype; do
 done < <(jq -r '.upload.uploads[] | [.path, .url, .headers["Content-Type"]] | @tsv' <<<"$RESPONSE")
 [[ "$TOTAL" -gt 0 ]] && echo >&2
 
-call POST "$FINALIZE" "$(jq -n --arg v "$VERSION" '{versionId: $v}')"
+FINALIZE_BODY="$(jq -n --arg v "$VERSION" --arg t "${CLAIM:-}" '{versionId: $v} + (if $t != "" then {claimToken: $t} else {} end)')"
+call POST "$FINALIZE" "$FINALIZE_BODY"
 [[ "$STATUS" =~ ^2 ]] || die "finalize failed ($STATUS): $(jq -r '.error // .message // .' <<<"$RESPONSE" 2>/dev/null || echo "$RESPONSE")"
 
 LIVE="$(jq -r '.live // empty' <<<"$RESPONSE")"
@@ -208,7 +191,8 @@ chmod 600 "$STATE_FILE"
 echo "published: $URL"
 echo "files: $TOTAL uploaded, $SKIPPED unchanged"
 if [[ -n "$EXPIRES" ]]; then
-  echo "expires: $EXPIRES (anonymous site)"
+  echo "deleted in: 6 hours unless claimed (expires: $EXPIRES)"
   [[ -n "${CLAIM_URL:-}" ]] && echo "keep it: $CLAIM_URL"
+  echo "tip: sign in with login.sh and open keep it: — otherwise this site is deleted"
 fi
 exit 0

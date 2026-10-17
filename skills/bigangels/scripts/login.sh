@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Sign in to BigAngels from the terminal, so published sites are permanent.
 #
-#   login.sh                  open the browser (default on macOS/Linux with a display)
-#   login.sh --browser        same as login.sh with no arguments
-#   login.sh --email <email>          email a 6-digit code (headless / SSH fallback)
+#   login.sh                  show email-code sign-in instructions (default)
+#   login.sh --browser        optional browser sign-in
+#   login.sh --email <email>          email a 6-digit code (default agent flow)
 #   login.sh --email <email> <code>   verify the code and save an API key
 #   login.sh <email>          same as --email (legacy)
 #   login.sh <email> <code>   verify (legacy)
@@ -29,6 +29,8 @@ CLIENT="$(bigangels_client_id "$_INVOKING" login-sh)"
 STATE_DIR="${BIGANGELS_HOME:-$HOME/.bigangels}"
 CREDENTIALS="$STATE_DIR/credentials"
 STATE_FILE="$STATE_DIR/sites.json"
+DEVICE="$(bigangels_publish_device_id "$STATE_DIR")"
+DEVICE_HDR=(-H "X-BigAngels-Publish-Device: $DEVICE")
 KEY_NAME="${CLIENT%%/*}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -48,7 +50,7 @@ post() {
   local out auth=()
   [[ -n "${3:-}" ]] && auth=(-H "Authorization: Bearer $3")
   out="$(curl -sS -X POST "$API$1" -H "content-type: application/json" -H "X-BigAngels-Client: $CLIENT" \
-    ${auth[@]+"${auth[@]}"} --data-binary "$2" -w $'\n%{http_code}')" || die "could not reach $API"
+    "${DEVICE_HDR[@]}" ${auth[@]+"${auth[@]}"} --data-binary "$2" -w $'\n%{http_code}')" || die "could not reach $API"
   STATUS="${out##*$'\n'}"; RESPONSE="${out%$'\n'*}"
 }
 error_of() { jq -r '.error // empty' <<<"$RESPONSE" 2>/dev/null || echo "$RESPONSE"; }
@@ -66,7 +68,27 @@ claim_local_sites() {
     fi
   done < <(jq -r 'to_entries[] | select(.value.claimToken != "" and .value.expiresAt != "") | [.key, .value.claimToken] | @tsv' "$STATE_FILE")
   chmod 600 "$STATE_FILE"
-  [[ $kept -gt 0 ]] && echo "kept $kept earlier site(s) — they no longer expire"
+  if [[ $kept -gt 0 ]]; then echo "kept $kept earlier site(s) — they no longer expire"; fi
+  recover_remote_sites "$key"
+  return 0
+}
+
+recover_remote_sites() {
+  local key="$1"
+  local list
+  list="$(curl -sS "$API/api/v1/me/recoverable-sites" -H "Authorization: Bearer $key" -H "X-BigAngels-Client: $CLIENT" \
+    "${DEVICE_HDR[@]}" -w $'\n%{http_code}')" || return 0
+  local status="${list##*$'\n'}"; list="${list%$'\n'*}"
+  [[ "$status" == 200 ]] || return 0
+  local slugs
+  slugs="$(jq -r '[.sites[].slug] | @json' <<<"$list")"
+  [[ "$slugs" != "[]" ]] || return 0
+  post /api/v1/me/claim-recoverable "$(jq -n --argjson slugs "$slugs" '{slugs: $slugs}')" "$key"
+  if [[ "$STATUS" =~ ^2 ]]; then
+    local n
+    n="$(jq -r '.claimed | length' <<<"$RESPONSE")"
+    [[ "$n" -gt 0 ]] && echo "recovered $n temporary site(s) into your account"
+  fi
 }
 
 save_api_key() {
@@ -99,7 +121,7 @@ browser_sign_in() {
   trap 'rm -f "$out_file"; kill "$listener_pid" 2>/dev/null || true' RETURN
 
   python3 - "$state" "$out_file" "$port" <<'PY' &
-import sys, urllib.parse
+import sys, urllib.parse, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 STATE, OUT, PORT = sys.argv[1:4]
@@ -128,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        self.server.shutdown()
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
 HTTPServer(("127.0.0.1", int(PORT)), Handler).serve_forever()
 PY
@@ -140,7 +162,7 @@ PY
 
   echo "Opening your browser to sign in…"
   open_browser "$auth_url"
-  echo "Waiting for sign-in (up to 2 minutes). Use login.sh --email for headless SSH."
+  echo "Waiting for sign-in (up to 2 minutes). Email-code alternative: login.sh --email you@example.com."
 
   local i key
   for i in $(seq 1 120); do
@@ -180,15 +202,21 @@ case "${1:-}" in
   ""|-h|--help)
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then sed -n '2,14p' "$0"; exit 0
     fi
-    browser_sign_in
-    exit 0
+    echo "Ask the user for their email, then run: login.sh --email you@example.com"
+    echo "Ask for the emailed 6-digit code in chat, then run: login.sh --email you@example.com <code>"
+    echo "Prefer a browser? Run login.sh --browser. Check existing sign-in with login.sh --status first."
+    exit 1
     ;;
   --browser) browser_sign_in; exit 0 ;;
   --status)
-    [[ -f "$CREDENTIALS" ]] || { echo "not signed in"; exit 1; }
-    out="$(curl -sS "$API/api/v1/me" -H "Authorization: Bearer $(cat "$CREDENTIALS")" -w $'\n%{http_code}')" || die "could not reach $API"
-    [[ "${out##*$'\n'}" == 200 ]] || { echo "saved sign-in is no longer valid; sign in again"; exit 1; }
-    jq -r '"signed in as \(.user.email) · \(.usage.sites) sites"' <<<"${out%$'\n'*}"
+    key="${BIGANGELS_API_KEY:-$(cat "$CREDENTIALS" 2>/dev/null || true)}"
+    [[ -n "$key" ]] || { echo "not signed in"; exit 1; }
+    out="$(curl -sS "$API/api/v1/me" -H "Authorization: Bearer $key" -w $'\n%{http_code}')" || { echo "could not check sign-in; retry without replacing credentials" >&2; exit 2; }
+    case "${out##*$'\n'}" in
+      200) jq -er '"signed in as \(.user.email) · \(.usage.sites) sites"' <<<"${out%$'\n'*}" || exit 2 ;;
+      401) echo "saved sign-in is no longer valid; sign in again"; exit 1 ;;
+      *) echo "could not check sign-in; retry without replacing credentials" >&2; exit 2 ;;
+    esac
     exit 0
     ;;
   --logout) rm -f "$CREDENTIALS"; echo "signed out on this computer"; exit 0 ;;
