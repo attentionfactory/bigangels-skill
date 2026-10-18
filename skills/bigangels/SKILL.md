@@ -41,7 +41,7 @@ Run this preflight **before generating or modifying source files** for Next.js, 
 
 ## Agent workflow (checklist)
 
-1. **Install** (once per machine): `curl -fsSL https://bigangels.app/install.sh | bash` or `npx skills add attentionfactory/bigangels-skill --skill bigangels -g`. Agents can also fetch setup from `https://bigangels.app/llms.txt` or `/llm-info.txt`.
+1. **Install** (once per machine): `curl -fsSL https://bigangels.app/install.sh | bash` or `npx skills add attentionfactory/bigangels-skill --skill bigangels -g`. Agents can also fetch setup from `https://bigangels.app/llms.txt`, `/llm-info.txt`, or `/llms-full.txt`.
 2. **Publish**: `publish.sh <path>` → read the line `published: https://…` and give that URL to the user (clickable). Anonymous previews are **deleted in 6 hours** unless claimed.
 3. **Sign in to keep**: `login.sh --email` or `login.sh --browser` when the user wants permanent hosting on their account.
 4. **Verify**: the script already HTTP-checks the URL after finalize; if it fails, fix `BIGANGELS_API` and publish again.
@@ -455,7 +455,15 @@ For an anonymous test, use `publish.sh <path> --anonymous`; there is no need to 
 
 ### Client tagging (`BIGANGELS_CLIENT`)
 
-Scripts send `X-BigAngels-Client` as `<agent>/publish-sh` or `<agent>/login-sh`. Detection: skill path (`~/.cursor/skills` → `cursor`, `~/.codex/skills` → `codex`, `~/.claude/skills` → `claude-code`) or Cursor env. Override: `export BIGANGELS_CLIENT=cursor` (prefix only; role is appended).
+### Environment (`BIGANGELS_API`, `BIGANGELS_API_KEY`, …)
+
+- `BIGANGELS_API` — API origin (default `https://api.bigangels.app`; local dev: `http://bigangels.localhost:8787`).
+- `BIGANGELS_API_KEY` — optional `ba_live_*` key for CI or headless agents; overrides `~/.bigangels/credentials` in `publish.sh` and `login.sh --status` (never paste keys into chat).
+- `BIGANGELS_APP` — web app origin when using browser sign-in against a non-production API.
+- `BIGANGELS_HOME` — state directory (default `~/.bigangels`).
+- `BIGANGELS_CLIENT` — analytics/auth key name prefix; scripts send `X-BigAngels-Client` as `<agent>/publish-sh` or `<agent>/login-sh`. Detection: skill path (`~/.cursor/skills` → `cursor`, `~/.codex/skills` → `codex`, `~/.claude/skills` → `claude-code`) or Cursor env. Override: `export BIGANGELS_CLIENT=cursor` (prefix only; role is appended).
+
+**Headless / cloud agents:** use `login.sh --status` before sign-in; prefer `login.sh --email` (no browser). Install via `curl … | bash` skips optional sign-in prompts when stdout is not a TTY.
 
 ## Skill vs MCP
 
