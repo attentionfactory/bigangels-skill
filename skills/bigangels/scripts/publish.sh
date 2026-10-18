@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Publish a file or folder to BigAngels and print the live URL.
+# A folder's .bigangels/data.json (Site Data) and .bigangels/proxy.json (proxy routes) are published too;
+# problems print as warning: lines.
 #
-#   publish.sh <file-or-folder> [--name "Display name"] [--spa] [--new] [--anonymous]
+#   publish.sh <file-or-folder> [--name "Display name"] [--folder "Folder"] [--spa] [--[no-]cross-origin-isolation] [--new] [--anonymous]
 #
 # Re-publishing the same folder updates the same site (state lives in ~/.bigangels/sites.json).
+# --cross-origin-isolation turns on COOP/COEP so SharedArrayBuffer works (threaded wasm, games);
+# it stays on for later publishes until --no-cross-origin-isolation turns it off.
 # --anonymous ignores saved/environment credentials and remembers previews separately.
+# --folder files the site in a folder (created if new); --no-folder takes it out. Needs an account.
 # Env: BIGANGELS_API (API origin), BIGANGELS_CLIENT (optional override, e.g. cursor/publish-sh).
 
 set -euo pipefail
@@ -29,18 +34,22 @@ if command -v shasum >/dev/null; then sha256() { LC_ALL=C shasum -a 256 "$1" | c
 elif command -v sha256sum >/dev/null; then sha256() { LC_ALL=C sha256sum "$1" | cut -d' ' -f1; }
 else die "shasum or sha256sum is required"; fi
 
-TARGET="" NAME="" SPA="" FORCE_NEW="" ANONYMOUS=""
+TARGET="" NAME="" SPA="" ISOLATION="" FORCE_NEW="" ANONYMOUS="" FOLDER="" NO_FOLDER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name) NAME="${2:-}"; shift 2 ;;
     --spa) SPA=1; shift ;;
+    --folder) FOLDER="${2:-}"; [[ -n "$FOLDER" ]] || die "--folder needs a folder name"; shift 2 ;;
+    --no-folder) NO_FOLDER=1; shift ;;
     --new) FORCE_NEW=1; shift ;;
     --anonymous) ANONYMOUS=1; shift ;;
-    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    --cross-origin-isolation) ISOLATION=on; shift ;;
+    --no-cross-origin-isolation) ISOLATION=off; shift ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) [[ -z "$TARGET" ]] || die "only one file or folder can be published at a time"; TARGET="$1"; shift ;;
   esac
 done
-[[ -n "$TARGET" && -e "$TARGET" ]] || die "usage: publish.sh <file-or-folder> [--name NAME] [--spa] [--new] [--anonymous]"
+[[ -n "$TARGET" && -e "$TARGET" ]] || die "usage: publish.sh <file-or-folder> [--name NAME] [--folder FOLDER] [--spa] [--[no-]cross-origin-isolation] [--new] [--anonymous]"
 [[ -n "$ANONYMOUS" ]] && STATE_FILE="$STATE_DIR/anonymous-sites.json"
 
 if [[ -d "$TARGET" ]]; then
@@ -50,6 +59,9 @@ if [[ -d "$TARGET" ]]; then
     cd "$ROOT" && find . \( -name .git -o -name node_modules -o -name .bigangels \) -prune -o \
       -type f ! -name .DS_Store ! -name '.env' ! -name '.env.*' -print0 | sort -z
   )
+  # .bigangels/ is local state, except the Site Data and proxy route manifests at the site root.
+  if [[ -f "$ROOT/.bigangels/data.json" ]]; then FILES+=(".bigangels/data.json"); fi
+  if [[ -f "$ROOT/.bigangels/proxy.json" ]]; then FILES+=(".bigangels/proxy.json"); fi
 else
   ROOT="$(cd "$(dirname "$TARGET")" && pwd)"
   FILES=("$(basename "$TARGET")")
@@ -57,20 +69,45 @@ fi
 KEY="$ROOT"; [[ -f "$TARGET" ]] && KEY="$ROOT/${FILES[0]}"
 [[ ${#FILES[@]} -gt 0 ]] || die "nothing to publish in $TARGET"
 
+# Keep in sync with apps/edge/src/lib/files.ts. Files are uploaded byte for byte and never
+# recompressed: Build.wasm.br is sent as application/wasm and served with Content-Encoding: br.
 content_type() {
-  case "$(echo "${1##*.}" | tr '[:upper:]' '[:lower:]')" in
+  local name ext
+  name="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$name" in
+    *.wasm.br|*.wasm.gz|*.js.br|*.js.gz|*.mjs.br|*.mjs.gz|*.cjs.br|*.cjs.gz|*.json.br|*.json.gz|*.map.br|*.map.gz|\
+    *.data.br|*.data.gz|*.pck.br|*.pck.gz|*.mem.br|*.mem.gz|*.bin.br|*.bin.gz|*.glb.br|*.glb.gz|*.gltf.br|*.gltf.gz|\
+    *.css.br|*.css.gz|*.svg.br|*.svg.gz|*.txt.br|*.txt.gz|*.xml.br|*.xml.gz|\
+    *.wat.br|*.wat.gz)
+      name="${name%.*}" ;;
+  esac
+  ext="${name##*.}"
+  case "$ext" in
     html|htm) echo "text/html; charset=utf-8" ;;   css) echo "text/css; charset=utf-8" ;;
-    js|mjs) echo "text/javascript; charset=utf-8" ;; json) echo "application/json; charset=utf-8" ;;
+    js|mjs|cjs) echo "text/javascript; charset=utf-8" ;;
+    json|map) echo "application/json; charset=utf-8" ;;
     jsonl) echo "application/jsonl; charset=utf-8" ;;
-    md) echo "text/markdown; charset=utf-8" ;;       txt) echo "text/plain; charset=utf-8" ;;
-    csv) echo "text/csv; charset=utf-8" ;;           xml) echo "application/xml; charset=utf-8" ;;
-    svg) echo "image/svg+xml" ;; png) echo "image/png" ;; jpg|jpeg) echo "image/jpeg" ;;
-    gif) echo "image/gif" ;; webp) echo "image/webp" ;; avif) echo "image/avif" ;; ico) echo "image/x-icon" ;;
-    pdf) echo "application/pdf" ;; mp4) echo "video/mp4" ;; webm) echo "video/webm" ;; mov) echo "video/quicktime" ;;
-    mp3) echo "audio/mpeg" ;; wav) echo "audio/wav" ;; ogg) echo "audio/ogg" ;;
+    webmanifest) echo "application/manifest+json; charset=utf-8" ;;
+    md) echo "text/markdown; charset=utf-8" ;;       txt|wat) echo "text/plain; charset=utf-8" ;;
+    csv) echo "text/csv; charset=utf-8" ;;           tsv) echo "text/tab-separated-values; charset=utf-8" ;;
+    xml) echo "application/xml; charset=utf-8" ;;    yaml|yml) echo "text/yaml; charset=utf-8" ;;
+    py) echo "text/x-python; charset=utf-8" ;;
+    svg) echo "image/svg+xml" ;; png) echo "image/png" ;; apng) echo "image/apng" ;; jpg|jpeg) echo "image/jpeg" ;;
+    gif) echo "image/gif" ;; webp) echo "image/webp" ;; avif) echo "image/avif" ;; jxl) echo "image/jxl" ;;
+    bmp) echo "image/bmp" ;; tif|tiff) echo "image/tiff" ;; ico) echo "image/x-icon" ;;
+    ktx) echo "image/ktx" ;; ktx2) echo "image/ktx2" ;; dds) echo "image/vnd-ms.dds" ;; hdr) echo "image/vnd.radiance" ;;
+    pdf) echo "application/pdf" ;;
+    mp4|m4v) echo "video/mp4" ;; webm) echo "video/webm" ;; ogv) echo "video/ogg" ;; mov) echo "video/quicktime" ;;
+    m3u8) echo "application/vnd.apple.mpegurl" ;;
+    mp3) echo "audio/mpeg" ;; m4a) echo "audio/mp4" ;; aac) echo "audio/aac" ;; wav) echo "audio/wav" ;;
+    ogg|oga|opus) echo "audio/ogg" ;; weba) echo "audio/webm" ;; flac) echo "audio/flac" ;; mid|midi) echo "audio/midi" ;;
     woff) echo "font/woff" ;; woff2) echo "font/woff2" ;; ttf) echo "font/ttf" ;; otf) echo "font/otf" ;;
-    wasm) echo "application/wasm" ;; zip) echo "application/zip" ;;
-    *) echo "application/octet-stream" ;;
+    wasm) echo "application/wasm" ;;
+    glb) echo "model/gltf-binary" ;; gltf) echo "model/gltf+json" ;;
+    obj) echo "model/obj" ;; mtl) echo "model/mtl" ;; stl) echo "model/stl" ;; usdz) echo "model/vnd.usdz+zip" ;;
+    zip|whl) echo "application/zip" ;; tar) echo "application/x-tar" ;; gz|tgz) echo "application/gzip" ;;
+    br) echo "application/x-brotli" ;; zst) echo "application/zstd" ;;
+    *) echo "application/octet-stream" ;;  # .data .pck .unityweb .bin .basis .mem
   esac
 }
 
@@ -124,8 +161,11 @@ call() {
   STATUS="${out##*$'\n'}"; RESPONSE="${out%$'\n'*}"
 }
 
-BODY="$(jq -n --argjson files "$MANIFEST" --arg name "$NAME" --arg spa "$SPA" \
-  '{files: $files} + (if $name != "" then {displayName: $name} else {} end) + (if $spa != "" then {spaMode: true} else {} end)')"
+BODY="$(jq -n --argjson files "$MANIFEST" --arg name "$NAME" --arg spa "$SPA" --arg iso "$ISOLATION" \
+  --arg folder "$FOLDER" --arg nofolder "$NO_FOLDER" \
+  '{files: $files} + (if $name != "" then {displayName: $name} else {} end) + (if $spa != "" then {spaMode: true} else {} end)
+   + (if $iso == "" then {} else {crossOriginIsolation: ($iso == "on")} end)
+   + (if $folder != "" then {folder: $folder} elif $nofolder != "" then {folder: null} else {} end)')"
 
 STATUS=""
 if [[ -n "$SAVED" && -z "$FORCE_NEW" ]]; then
@@ -179,8 +219,19 @@ RESP_API="$(jq -r '.apiOrigin // empty' <<<"$RESPONSE")"
 if [[ -n "$RESP_API" && "$RESP_API" != "$API" ]]; then
   die "API mismatch: you called $API but finalize returned apiOrigin $RESP_API — set BIGANGELS_API to match the environment you want"
 fi
-serve_code="$(curl -sS -o /dev/null -w '%{http_code}' "$URL" || true)"
-[[ "$serve_code" =~ ^2 ]] || die "site is not reachable at $URL ($serve_code). If BIGANGELS_API points at localhost or an old host, production links will not work."
+serve_body="$(curl -sS -w $'\n%{http_code}' "$URL" || true)"
+serve_code="${serve_body##*$'\n'}"
+PROTECTED=""
+INVITE_ONLY=""
+# A password-protected or invite-only site answers 401 until a visitor gets in. That still means it's live.
+serve_gate="$(jq -r '.code // empty' <<<"${serve_body%$'\n'*}" 2>/dev/null || true)"
+if [[ "$serve_code" == 401 && "$serve_gate" == password_required ]]; then
+  PROTECTED=1
+elif [[ "$serve_code" == 401 && "$serve_gate" == access_required ]]; then
+  INVITE_ONLY=1
+elif ! [[ "$serve_code" =~ ^2 ]]; then
+  die "site is not reachable at $URL ($serve_code). If BIGANGELS_API points at localhost or an old host, production links will not work."
+fi
 EXPIRES="$(jq -r '.publishStatus.expiresAt // empty' <<<"$RESPONSE")"
 TMP="$(mktemp)"
 jq --arg k "$KEY" --arg slug "$SLUG" --arg claim "${CLAIM:-}" --arg claimUrl "${CLAIM_URL:-}" --arg url "$URL" --arg exp "$EXPIRES" \
@@ -190,6 +241,20 @@ chmod 600 "$STATE_FILE"
 
 echo "published: $URL"
 echo "files: $TOTAL uploaded, $SKIPPED unchanged"
+VANITY="$(jq -r '.vanityUrl // empty' <<<"$RESPONSE")"
+if [[ -n "$VANITY" ]]; then echo "also at: $VANITY"; fi
+FOLDER_NAME="$(jq -r '.folder.name // empty' <<<"$RESPONSE")"
+if [[ -n "$FOLDER_NAME" ]]; then echo "folder: $FOLDER_NAME"; fi
+if [[ -n "$PROTECTED" ]]; then echo "password: on (visitors enter the site password first; it was not changed)"; fi
+if [[ -n "$INVITE_ONLY" ]]; then echo "access: specific people (visitors confirm an invited email first; the list was not changed)"; fi
+SITE_DATA="$(jq -r 'if .siteData then (if .siteData.enabled then "on (" + (.siteData.collections | join(", ")) + ")" else "off" end) else empty end' <<<"$RESPONSE")"
+if [[ -n "$SITE_DATA" ]]; then echo "site data: $SITE_DATA"; fi
+# Proxy routes (.bigangels/proxy.json). Keys stay on the server as variables; see SKILL.md.
+PROXY="$(jq -r 'if .proxy then (if .proxy.enabled then "on (" + (.proxy.routes | join(", ")) + ")" else "off" end) else empty end' <<<"$RESPONSE")"
+if [[ -n "$PROXY" ]]; then echo "proxy routes: $PROXY"; fi
+while IFS= read -r warning; do
+  if [[ -n "$warning" ]]; then echo "warning: $warning"; fi
+done < <(jq -r '.warnings[]? // empty' <<<"$RESPONSE")
 if [[ -n "$EXPIRES" ]]; then
   echo "deleted in: 6 hours unless claimed (expires: $EXPIRES)"
   [[ -n "${CLAIM_URL:-}" ]] && echo "keep it: $CLAIM_URL"

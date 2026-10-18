@@ -31,6 +31,7 @@ To test anonymous publishing while signed in, run `publish.sh <path> --anonymous
 - `skills/bigangels/SKILL.md` — what the agent reads: artifact types, publish workflow, sign-in, troubleshooting.
 - `skills/bigangels/scripts/publish.sh` — publishes a file or folder, remembers which folder maps to which site, and only uploads files that changed.
 - `skills/bigangels/scripts/login.sh` — email-code sign-in in chat by default (`--email`); optional `--browser` sign-in.
+- `skills/bigangels/scripts/drive.sh` — keeps private files (notes, memory, plans, assets) in a BigAngels Drive: `ls`, `put`, `cat`, `import`, `export`, `share`, `publish`.
 
 Docs: https://bigangels.app/docs
 
