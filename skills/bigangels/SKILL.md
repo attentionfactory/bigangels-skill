@@ -21,7 +21,7 @@ description: >
 
 Publish a file or folder and get a live URL like `https://bright-canvas-a7k2.<sites-domain>/`. No hosting setup, DNS, or deploy pipeline for the user — you upload static artifacts and return the link.
 
-**Publish without sign-in** for a live preview **deleted in 6 hours** unless claimed (banner on the site). Use the skill scripts — do not invent credentials or raw `curl` unless implementing the full upload flow.
+**Publish without sign-in** for a live preview that **goes offline after 6 hours** (banner on the site); claiming it within 7 days brings it back for good. Use the skill scripts — do not invent credentials or raw `curl` unless implementing the full upload flow.
 
 On a publish/deploy request: run `publish.sh` first. If the user wants the site kept permanently, run `login.sh --status` (exit 0 = already signed in) or sign in with `login.sh --email`, then publish again or use the `keep it:` / claim link. Never paste claim tokens into chat.
 
@@ -42,7 +42,7 @@ Run this preflight **before generating or modifying source files** for Next.js, 
 ## Agent workflow (checklist)
 
 1. **Install** (once per machine): `curl -fsSL https://bigangels.app/install.sh | bash` or `npx skills add attentionfactory/bigangels-skill --skill bigangels -g`. Agents can also fetch setup from `https://bigangels.app/llms.txt`, `/llm-info.txt`, or `/llms-full.txt`.
-2. **Publish**: `publish.sh <path>` → read the line `published: https://…` and give that URL to the user (clickable). Anonymous previews are **deleted in 6 hours** unless claimed.
+2. **Publish**: `publish.sh <path>` → read the line `published: https://…` and give that URL to the user (clickable). Anonymous previews **go offline after 6 hours**; claim within 7 days to keep them.
 3. **Sign in to keep**: `login.sh --email` or `login.sh --browser` when the user wants permanent hosting on their account.
 4. **Verify**: the script already HTTP-checks the URL after finalize; if it fails, fix `BIGANGELS_API` and publish again.
 
@@ -128,7 +128,18 @@ Publish the folder the engine exports, as is. Every file is uploaded byte for by
 
 Return the exact URL from `published:` as a clickable link. **Never** share a URL before finalize — only `published:` means the site is live.
 
-Do not paste claim tokens into chat; they stay in local state. If you see `deleted in:` or `expires:` (anonymous preview), **stress urgency**: the site is **deleted in 6 hours** unless they sign up and open the `keep it:` link. Do not say “turn off”, “scheduled off”, or “we’re not deleting.”
+Do not paste claim tokens into chat; they stay in local state. If you see `offline in:` or `expires:` (anonymous preview), **stress urgency**: the site **goes offline in 6 hours** unless they sign up and open the `keep it:` link. Tell them plainly that they have 7 days after that to bring it back, and that an unclaimed preview is then deleted for good. Don't make it sound permanent.
+
+## Edit a site that's already live
+
+Read what's live before changing it, instead of guessing (works on password-protected and invite-only sites too):
+
+```bash
+curl -sS https://api.bigangels.app/api/v1/sites/<slug>/files -H "Authorization: Bearer $(cat ~/.bigangels/credentials)"
+curl -sS https://api.bigangels.app/api/v1/sites/<slug>/files/index.html -H "Authorization: Bearer $(cat ~/.bigangels/credentials)" -o index.html
+```
+
+The listing gives each file's path, size, contentType, hash and url. For an anonymous preview, send its claim token as `X-Claim-Token: <token>` instead (a header, never the URL). Edit the files, then run `publish.sh` on the folder again: unchanged files are skipped, only your edits upload. Over MCP, `get_site` lists paths and `read_site_file` returns a text file.
 
 ## Password-protect a site
 
@@ -447,6 +458,8 @@ login.sh --email you@example.com 123456
 
 On success, a `ba_live_*` key is saved privately in `~/.bigangels/credentials`. Do not print or paste the key. Confirm `login.sh --status`, then continue publishing automatically. Invalid or expired codes: ask for a corrected code or request a fresh one; don't switch flows silently.
 
+**No `login.sh` here?** The same flow is two HTTP calls: `POST https://api.bigangels.app/api/v1/auth/request-code {"email"}`, ask the person for the emailed code, then `POST .../auth/verify-code {"email","code","keyName":"<your-tool>"}`. The reply's `apiKey` is shown once: write it to `~/.bigangels/credentials` (mode 600) and never print it. A new email creates a free account.
+
 **Browser alternative:** if the user prefers browser sign-in, run `login.sh --browser` and let them approve the connection. **OAuth alternative:** for agents without shell access, connect `https://api.bigangels.app/mcp` through the client's connector settings and OAuth. Do not claim to install or run scripts in an environment that cannot execute commands.
 
 `login.sh --logout` signs out locally. Never guess an email or code.
@@ -468,7 +481,7 @@ For an anonymous test, use `publish.sh <path> --anonymous`; there is no need to 
 ## Skill vs MCP
 
 - **Skill (this guide):** `publish.sh` + `login.sh` + `drive.sh` + `~/.bigangels/credentials`. Installed by `install.sh`.
-- **MCP (separate):** `https://api.bigangels.app/mcp` — OAuth in Cursor Settings. Not installed by `install.sh`. Its tools cover publishing, `get_site`, Site Data, versions, search and folders, variables and small Drive files; buying domains and transfer codes need the API key from `login.sh`.
+- **MCP (separate):** `https://api.bigangels.app/mcp` — OAuth in Cursor Settings. Not installed by `install.sh`. Its tools cover publishing, `get_site`, `read_site_file`, Site Data, versions, search and folders, variables and small Drive files; buying domains and transfer codes need the API key from `login.sh`.
 
 Use skill scripts unless the user is explicitly testing MCP OAuth (then use MCP tools only, no `publish.sh`).
 

@@ -145,7 +145,7 @@ credentials_valid() {
 maybe_sign_in() {
   if credentials_valid; then return 0; fi
   if [[ -n "$API_KEY" ]]; then
-    echo "saved sign-in is no longer valid — publishing without an account (deleted in 6 hours)" >&2
+    echo "saved sign-in is no longer valid — publishing without an account (offline after 6 hours)" >&2
     API_KEY=""
     AUTH=()
   fi
@@ -256,8 +256,8 @@ while IFS= read -r warning; do
   if [[ -n "$warning" ]]; then echo "warning: $warning"; fi
 done < <(jq -r '.warnings[]? // empty' <<<"$RESPONSE")
 if [[ -n "$EXPIRES" ]]; then
-  echo "deleted in: 6 hours unless claimed (expires: $EXPIRES)"
+  echo "offline in: 6 hours; claim within 7 days to bring it back (expires: $EXPIRES)"
   [[ -n "${CLAIM_URL:-}" ]] && echo "keep it: $CLAIM_URL"
-  echo "tip: sign in with login.sh and open keep it: — otherwise this site is deleted"
+  echo "tip: sign in with login.sh and open keep it: — otherwise this site goes offline, then is deleted after 7 days"
 fi
 exit 0
