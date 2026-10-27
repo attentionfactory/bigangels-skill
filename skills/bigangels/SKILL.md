@@ -23,7 +23,7 @@ Publish a file or folder and get a live URL like `https://bright-canvas-a7k2.<si
 
 **Publish without sign-in** for a live preview that **goes offline after 6 hours** (banner on the site); claiming it within 7 days brings it back for good. Use the skill scripts — do not invent credentials or raw `curl` unless implementing the full upload flow.
 
-On a publish/deploy request: run `publish.sh` first. If the user wants the site kept permanently, run `login.sh --status` (exit 0 = already signed in) or sign in with `login.sh --email`, then publish again or use the `keep it:` / claim link. Never paste claim tokens into chat.
+On a publish/deploy request: run `publish.sh` first. If the user wants the site kept permanently, run `login.sh --status` (exit 0 = already signed in) or sign in with `login.sh --email`, then publish again or use the `keep it:` / claim link. Share the private keep link only with the intended owner; never expose claim tokens publicly.
 
 ## Before starting a project that needs a build
 
@@ -42,7 +42,7 @@ Run this preflight **before generating or modifying source files** for Next.js, 
 ## Agent workflow (checklist)
 
 1. **Install** (once per machine): `curl -fsSL https://bigangels.app/install.sh | bash` or `npx skills add attentionfactory/bigangels-skill --skill bigangels -g`. Agents can also fetch setup from `https://bigangels.app/llms.txt`, `/llm-info.txt`, or `/llms-full.txt`.
-2. **Publish**: `publish.sh <path>` → read the line `published: https://…` and give that URL to the user (clickable). Anonymous previews **go offline after 6 hours**; claim within 7 days to keep them.
+2. **Publish**: `publish.sh <path>` → read the line `published: https://…` and give that URL to the user (clickable). Anonymous previews **go offline after 6 hours**; claim within 7 days to keep them. Give the user the private `keep it:` link as well as the public site URL, and explain that the public banner alone cannot keep the site. Treat the keep link as a secret: share it only with the intended owner, never publicly.
 3. **Sign in to keep**: `login.sh --email` or `login.sh --browser` when the user wants permanent hosting on their account.
 4. **Verify**: the script already HTTP-checks the URL after finalize; if it fails, fix `BIGANGELS_API` and publish again.
 
@@ -128,7 +128,7 @@ Publish the folder the engine exports, as is. Every file is uploaded byte for by
 
 Return the exact URL from `published:` as a clickable link. **Never** share a URL before finalize — only `published:` means the site is live.
 
-Do not paste claim tokens into chat; they stay in local state. If you see `offline in:` or `expires:` (anonymous preview), **stress urgency**: the site **goes offline in 6 hours** unless they sign up and open the `keep it:` link. Tell them plainly that they have 7 days after that to bring it back, and that an unclaimed preview is then deleted for good. Don't make it sound permanent.
+Share the private keep link only with the intended owner; never expose claim tokens publicly. If you see `offline in:` or `expires:` (anonymous preview), **stress urgency**: the site **goes offline in 6 hours** unless they sign up and open the `keep it:` link. Tell them plainly that they have 7 days after that to bring it back, and that an unclaimed preview is then deleted for good. Don't make it sound permanent.
 
 ## Edit a site that's already live
 
@@ -138,6 +138,8 @@ Read what's live before changing it, instead of guessing (works on password-prot
 curl -sS https://api.bigangels.app/api/v1/sites/<slug>/files -H "Authorization: Bearer $(cat ~/.bigangels/credentials)"
 curl -sS https://api.bigangels.app/api/v1/sites/<slug>/files/index.html -H "Authorization: Bearer $(cat ~/.bigangels/credentials)" -o index.html
 ```
+
+For built projects, `publish.sh dist/` (or `out/`/`build/`) saves the adjacent project privately under `.bigangels/source/` when its parent has `package.json`. Use `--source DIR` for other layouts or `--no-source` to opt out. Source counts toward the same site limits as output. Dependencies, the build, `.env*`, and common credential paths and patterns are excluded; scanning is best effort, so review the source before publishing and never rely on it to find every secret. Fetch the saved source first, edit it, build it, and publish the output with the updated source. A fresh agent can use `--site SLUG --base-version VERSION` using the version returned by the files API. A conflict means reread and reconcile; `--overwrite` intentionally bypasses that check.
 
 The listing gives each file's path, size, contentType, hash and url. For an anonymous preview, send its claim token as `X-Claim-Token: <token>` instead (a header, never the URL). Edit the files, then run `publish.sh` on the folder again: unchanged files are skipped, only your edits upload. Over MCP, `get_site` lists paths and `read_site_file` returns a text file.
 

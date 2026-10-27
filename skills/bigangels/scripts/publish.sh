@@ -8,6 +8,8 @@
 # Re-publishing the same folder updates the same site (state lives in ~/.bigangels/sites.json).
 # --cross-origin-isolation turns on COOP/COEP so SharedArrayBuffer works (threaded wasm, games);
 # it stays on for later publishes until --no-cross-origin-isolation turns it off.
+# --source DIR saves private source; --no-source opts out. --site SLUG --base-version ID updates a known site.
+# --overwrite disables version conflict protection.
 # --anonymous ignores saved/environment credentials and remembers previews separately.
 # --folder files the site in a folder (created if new); --no-folder takes it out. Needs an account.
 # Env: BIGANGELS_API (API origin), BIGANGELS_CLIENT (optional override, e.g. cursor/publish-sh).
@@ -34,9 +36,14 @@ if command -v shasum >/dev/null; then sha256() { LC_ALL=C shasum -a 256 "$1" | c
 elif command -v sha256sum >/dev/null; then sha256() { LC_ALL=C sha256sum "$1" | cut -d' ' -f1; }
 else die "shasum or sha256sum is required"; fi
 
-TARGET="" NAME="" SPA="" ISOLATION="" FORCE_NEW="" ANONYMOUS="" FOLDER="" NO_FOLDER=""
+TARGET="" NAME="" SPA="" ISOLATION="" FORCE_NEW="" ANONYMOUS="" FOLDER="" NO_FOLDER="" SOURCE="" NO_SOURCE="" OVERWRITE="" SITE="" BASE_VERSION=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --site) SITE="${2:-}"; [[ -n "$SITE" ]] || die "--site needs a slug"; shift 2 ;;
+    --base-version) BASE_VERSION="${2:-}"; [[ -n "$BASE_VERSION" ]] || die "--base-version needs a version ID"; shift 2 ;;
+    --source) SOURCE="${2:-}"; [[ -n "$SOURCE" ]] || die "--source needs a directory"; shift 2 ;;
+    --no-source) NO_SOURCE=1; shift ;;
+    --overwrite) OVERWRITE=1; shift ;;
     --name) NAME="${2:-}"; shift 2 ;;
     --spa) SPA=1; shift ;;
     --folder) FOLDER="${2:-}"; [[ -n "$FOLDER" ]] || die "--folder needs a folder name"; shift 2 ;;
@@ -68,6 +75,38 @@ else
 fi
 KEY="$ROOT"; [[ -f "$TARGET" ]] && KEY="$ROOT/${FILES[0]}"
 [[ ${#FILES[@]} -gt 0 ]] || die "nothing to publish in $TARGET"
+
+# Source is private version content, never part of the served build. Only infer a project
+# from a conventional build directory; do not recursively upload an arbitrary parent.
+[[ -z "$SOURCE" || -z "$NO_SOURCE" ]] || die "--source and --no-source cannot be combined"
+if [[ -z "$SOURCE" && -z "$NO_SOURCE" && -d "$TARGET" ]]; then
+  case "$(basename "$ROOT")" in
+    dist|out|build) [[ -f "$(dirname "$ROOT")/package.json" ]] && SOURCE="$(dirname "$ROOT")" ;;
+  esac
+fi
+SOURCE_ROOT=""
+SOURCE_FILES=()
+if [[ -n "$SOURCE" ]]; then
+  [[ -d "$SOURCE" ]] || die "source directory not found: $SOURCE"
+  echo "warning: saving project source privately; secret scanning is best effort, review your source before publishing" >&2
+  SOURCE_ROOT="$(cd "$SOURCE" && pwd)"
+  [[ "$SOURCE_ROOT" != "$ROOT" ]] || die "source and build directories must be different"
+  SOURCE_EXCLUDE=""
+  case "$ROOT/" in "$SOURCE_ROOT/"*) SOURCE_EXCLUDE="./${ROOT#"$SOURCE_ROOT"/}" ;; esac
+  while IFS= read -r -d '' f; do
+    f="${f#./}"
+    # Never traverse the output, local state, dependencies, or common secret files.
+    [[ "$SOURCE_ROOT/$f" == "$ROOT/"* ]] && continue
+    case "$(basename "$f" | tr '[:upper:]' '[:lower:]')" in
+      .env*|.npmrc|.netrc|.pypirc|id_rsa|id_ed25519|*.pem|*.key|*.p12|*.pfx|*.keystore|*credentials*|*secret*) echo "warning: excluded sensitive source path $f" >&2; continue ;;
+    esac
+    # Conservative common credential patterns. This is not a complete secret scanner.
+    if LC_ALL=C grep -aqE 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|AKIA[0-9A-Z]{16}|(sk_live_|sk-proj-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}' "$SOURCE_ROOT/$f"; then
+      echo "warning: excluded possible secret in source file $f" >&2; continue
+    fi
+    SOURCE_FILES+=("$f")
+  done < <(cd "$SOURCE_ROOT" && find . \( -path "${SOURCE_EXCLUDE:-./.bigangels-no-build}" -o -name .git -o -name node_modules -o -name .bigangels -o -name .next -o -name .turbo -o -name .venv -o -name .aws -o -name .ssh -o -iname "*secret*" -o -iname "*credentials*" -o -iname ".env*" \) -prune -o -type f ! -name .DS_Store -print0 | sort -z)
+fi
 
 # Keep in sync with apps/edge/src/lib/files.ts. Files are uploaded byte for byte and never
 # recompressed: Build.wasm.br is sent as application/wasm and served with Content-Encoding: br.
@@ -112,11 +151,15 @@ content_type() {
 }
 
 MANIFEST="$(
-  for f in "${FILES[@]}"; do
+  { for f in "${FILES[@]}"; do
     hash="$(sha256 "$ROOT/$f")" || exit 1
     [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || exit 1
     printf '%s\t%s\t%s\t%s\n' "$f" "$(wc -c <"$ROOT/$f" | tr -d ' ')" "$(content_type "$f")" "$hash"
-  done | jq -Rn '[inputs | split("\t") | {path: .[0], size: (.[1] | tonumber), contentType: .[2], hash: .[3]}]'
+  done
+  for f in ${SOURCE_FILES[@]+"${SOURCE_FILES[@]}"}; do
+    hash="$(sha256 "$SOURCE_ROOT/$f")" || exit 1
+    printf '%s\t%s\t%s\t%s\n' ".bigangels/source/$f" "$(wc -c <"$SOURCE_ROOT/$f" | tr -d ' ')" "$(content_type "$f")" "$hash"
+  done; } | jq -Rn '[inputs | split("\t") | {path: .[0], size: (.[1] | tonumber), contentType: .[2], hash: .[3]}]'
 )"
 
 mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
@@ -168,11 +211,21 @@ BODY="$(jq -n --argjson files "$MANIFEST" --arg name "$NAME" --arg spa "$SPA" --
    + (if $folder != "" then {folder: $folder} elif $nofolder != "" then {folder: null} else {} end)')"
 
 STATUS=""
+if [[ -n "$SITE" ]]; then
+  [[ "$SITE" =~ ^[a-z0-9-]+$ ]] || die "--site must be a site slug"
+  [[ -n "$API_KEY" ]] || die "--site requires an account key"
+  [[ -z "$FORCE_NEW" ]] || die "--site and --new cannot be combined"
+  if [[ -z "$BASE_VERSION" && -z "$OVERWRITE" ]]; then die "--site requires --base-version from the version you read, or --overwrite"; fi
+  SAVED="$(jq -n --arg slug "$SITE" --arg version "$BASE_VERSION" '{slug:$slug, versionId:$version, claimToken:""}')"
+fi
 if [[ -n "$SAVED" && -z "$FORCE_NEW" ]]; then
   SLUG="$(jq -r .slug <<<"$SAVED")"; CLAIM="$(jq -r .claimToken <<<"$SAVED")"
   CLAIM_URL="$(jq -r '.claimUrl // empty' <<<"$SAVED")"
-  call PUT "$API/api/v1/publish/$SLUG" "$(jq --arg t "$CLAIM" '. + {claimToken: $t}' <<<"$BODY")"
+  BASE="$(jq -r '.versionId // empty' <<<"$SAVED")"
+  UPDATE_BODY="$(jq --arg t "$CLAIM" --arg base "$BASE" --arg overwrite "$OVERWRITE" '. + {claimToken: $t} + (if $base != "" and $overwrite == "" then {baseVersionId: $base} else {} end)' <<<"$BODY")"
+  call PUT "$API/api/v1/publish/$SLUG" "$UPDATE_BODY"
   if [[ "$STATUS" == 404 || "$STATUS" == 410 ]]; then
+    [[ -z "$SITE" ]] || die "site $SLUG not found or expired"
     echo "previous site $SLUG is gone (expired); creating a new one" >&2
     STATUS=""
   elif [[ "$STATUS" == 401 && -n "$ANONYMOUS" ]]; then
@@ -198,7 +251,9 @@ N=0
 while IFS=$'\t' read -r path url ctype; do
   N=$((N + 1))
   printf '\ruploading %d/%d' "$N" "$TOTAL" >&2
-  code="$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$url" -H "Content-Type: $ctype" --data-binary @"$ROOT/$path")" \
+  local_file="$ROOT/$path"
+  if [[ "$path" == .bigangels/source/* && -n "$SOURCE_ROOT" ]]; then local_file="$SOURCE_ROOT/${path#.bigangels/source/}"; fi
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$url" -H "Content-Type: $ctype" --data-binary @"$local_file")" \
     || die "upload failed for $path"
   [[ "$code" =~ ^2 ]] || die "upload failed for $path ($code)"
 done < <(jq -r '.upload.uploads[] | [.path, .url, .headers["Content-Type"]] | @tsv' <<<"$RESPONSE")
@@ -219,6 +274,13 @@ RESP_API="$(jq -r '.apiOrigin // empty' <<<"$RESPONSE")"
 if [[ -n "$RESP_API" && "$RESP_API" != "$API" ]]; then
   die "API mismatch: you called $API but finalize returned apiOrigin $RESP_API — set BIGANGELS_API to match the environment you want"
 fi
+EXPIRES="$(jq -r '.publishStatus.expiresAt // empty' <<<"$RESPONSE")"
+TMP="$(mktemp)"
+jq --arg k "$KEY" --arg slug "$SLUG" --arg claim "${CLAIM:-}" --arg claimUrl "${CLAIM_URL:-}" --arg url "$URL" --arg exp "$EXPIRES" --arg version "$VERSION" \
+  '.[$k] = {slug: $slug, claimToken: $claim, claimUrl: $claimUrl, siteUrl: $url, expiresAt: $exp, versionId: $version}' "$STATE_FILE" >"$TMP" \
+  && mv "$TMP" "$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
 serve_body="$(curl -sS -w $'\n%{http_code}' "$URL" || true)"
 serve_code="${serve_body##*$'\n'}"
 PROTECTED=""
@@ -232,15 +294,10 @@ elif [[ "$serve_code" == 401 && "$serve_gate" == access_required ]]; then
 elif ! [[ "$serve_code" =~ ^2 ]]; then
   die "site is not reachable at $URL ($serve_code). If BIGANGELS_API points at localhost or an old host, production links will not work."
 fi
-EXPIRES="$(jq -r '.publishStatus.expiresAt // empty' <<<"$RESPONSE")"
-TMP="$(mktemp)"
-jq --arg k "$KEY" --arg slug "$SLUG" --arg claim "${CLAIM:-}" --arg claimUrl "${CLAIM_URL:-}" --arg url "$URL" --arg exp "$EXPIRES" \
-  '.[$k] = {slug: $slug, claimToken: $claim, claimUrl: $claimUrl, siteUrl: $url, expiresAt: $exp}' "$STATE_FILE" >"$TMP" \
-  && mv "$TMP" "$STATE_FILE"
-chmod 600 "$STATE_FILE"
 
 echo "published: $URL"
 echo "files: $TOTAL uploaded, $SKIPPED unchanged"
+if [[ -n "$SOURCE_ROOT" ]]; then echo "source: saved privately (secret scanning is best effort; review exclusions)"; fi
 VANITY="$(jq -r '.vanityUrl // empty' <<<"$RESPONSE")"
 if [[ -n "$VANITY" ]]; then echo "also at: $VANITY"; fi
 FOLDER_NAME="$(jq -r '.folder.name // empty' <<<"$RESPONSE")"
